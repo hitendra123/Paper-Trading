@@ -1,1 +1,6 @@
 streamlit
+kiteconnect
+pandas
+numpy
+plotly
+requests

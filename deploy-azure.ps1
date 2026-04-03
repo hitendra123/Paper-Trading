@@ -11,6 +11,24 @@ $SKU            = "B1"
 Write-Host "==> Logging in to Azure..." -ForegroundColor Cyan
 az login
 
+Write-Host ""
+Write-Host "==> Available subscriptions:" -ForegroundColor Cyan
+az account list --output table
+
+Write-Host ""
+Write-Host "==> Selecting Microsoft Sponsored Subscription..." -ForegroundColor Cyan
+$SUB_ID = az account list --query "[?contains(name,'Sponsored') || contains(name,'sponsored') || contains(name,'Visual Studio') || contains(name,'Free') || contains(name,'Student')].id" -o tsv | Select-Object -First 1
+
+if ($SUB_ID) {
+    Write-Host "    Found sponsored subscription: $SUB_ID" -ForegroundColor Green
+    az account set --subscription $SUB_ID
+} else {
+    Write-Host "    No sponsored subscription auto-detected." -ForegroundColor Yellow
+    Write-Host "    Copy a Subscription ID from the table above and paste it:" -ForegroundColor Yellow
+    $SUB_ID = Read-Host "    Subscription ID"
+    az account set --subscription $SUB_ID
+}
+
 Write-Host "==> Creating resource group '$RESOURCE_GROUP'..." -ForegroundColor Cyan
 az group create --name $RESOURCE_GROUP --location $LOCATION
 

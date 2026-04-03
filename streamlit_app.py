@@ -1,17 +1,16 @@
 """
-Zerodha Intraday Auto Trading Bot
+Intraday Auto Trading Bot
 Supports: Equity + Options (NSE/NFO)
+Data Sources: yfinance (default, free) | Zerodha Kite Connect (optional, live trading)
 Strategies: EMA Crossover, ORB, RSI+VWAP, Options CE/PE Buying, Short Straddle
 """
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
 from datetime import datetime, time, timedelta
-import time as time_module
 
-from bot.kite_auth import get_kite_client, generate_login_url, generate_access_token, get_profile, get_margins
+from bot.yfinance_data import fetch_ohlcv, get_live_price, nse_ticker
 from bot.strategies import (
     EMAcrossover, OpeningRangeBreakout, RSIVWAPStrategy,
     TrendBasedOptionsBuying, ShortStraddle,
@@ -20,11 +19,18 @@ from bot.strategies import (
 )
 from bot.order_manager import OrderManager, RiskManager, get_atm_strike
 
+# Optional Zerodha imports
+try:
+    from bot.kite_auth import get_kite_client, generate_login_url, generate_access_token, get_profile
+    _KITE_AVAILABLE = True
+except Exception:
+    _KITE_AVAILABLE = False
+
 # ─────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="Zerodha Intraday Bot",
+    page_title="Intraday Trading Bot",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -51,6 +57,7 @@ st.markdown("""
 # ─────────────────────────────────────────────
 def init_state():
     defaults = {
+        "data_source": "yfinance",   # "yfinance" | "zerodha"
         "kite": None,
         "access_token": None,
         "profile": None,
@@ -69,73 +76,142 @@ init_state()
 
 
 # ─────────────────────────────────────────────
-# SAMPLE DATA (for demo/paper trade)
+# DATA FETCHING (yfinance or Zerodha Kite)
 # ─────────────────────────────────────────────
-def generate_sample_ohlcv(symbol: str = "NIFTY", periods: int = 78) -> pd.DataFrame:
-    """Generate realistic 5-min OHLCV data for demo."""
+
+def _fallback_ohlcv(symbol: str, periods: int = 78) -> pd.DataFrame:
+    """Simulated data used only when real fetch fails."""
     np.random.seed(42)
-    base = 22000 if "NIFTY" in symbol else 48000 if "BANK" in symbol else 1000
+    base = 22000 if "NIFTY" in symbol.upper() else 48000 if "BANK" in symbol.upper() else 1000
     dates = pd.date_range(start="2024-01-15 09:15:00", periods=periods, freq="5min")
     close = base + np.cumsum(np.random.randn(periods) * 15)
     high = close + np.abs(np.random.randn(periods) * 8)
     low = close - np.abs(np.random.randn(periods) * 8)
     open_ = close + np.random.randn(periods) * 5
     volume = np.random.randint(50000, 500000, periods)
-    return pd.DataFrame({"date": dates, "open": open_, "high": high, "low": low,
-                         "close": close, "volume": volume})
+    return pd.DataFrame({"date": dates, "open": open_, "high": high,
+                         "low": low, "close": close, "volume": volume})
+
+
+@st.cache_data(ttl=300)   # cache for 5 minutes
+def get_ohlcv(symbol: str, data_source: str, interval: str = "5m") -> tuple[pd.DataFrame, bool]:
+    """
+    Returns (DataFrame, is_live).
+    Falls back to simulated data if yfinance returns nothing.
+    """
+    if data_source == "yfinance":
+        df = fetch_ohlcv(symbol, interval=interval, period="1d")
+        if not df.empty:
+            return df, True
+        # Market closed or bad symbol — try previous day
+        df = fetch_ohlcv(symbol, interval=interval, period="5d")
+        if not df.empty:
+            # Return only last trading session
+            last_date = df["date"].dt.date.iloc[-1]
+            df = df[df["date"].dt.date == last_date].reset_index(drop=True)
+            return df, True
+        return _fallback_ohlcv(symbol), False
+
+    elif data_source == "zerodha" and st.session_state.kite:
+        # Kite historical data (requires live session)
+        kite = st.session_state.kite
+        try:
+            from_dt = datetime.now().replace(hour=9, minute=15, second=0, microsecond=0)
+            to_dt = datetime.now()
+            instruments = kite.ltp([f"NSE:{symbol}"])
+            token = list(instruments.values())[0]["instrument_token"]
+            records = kite.historical_data(token, from_dt, to_dt, "5minute")
+            df = pd.DataFrame(records)
+            df = df.rename(columns={"date": "date", "open": "open", "high": "high",
+                                     "low": "low", "close": "close", "volume": "volume"})
+            return df, True
+        except Exception:
+            pass
+
+    return _fallback_ohlcv(symbol), False
 
 
 # ─────────────────────────────────────────────
-# SIDEBAR — AUTHENTICATION
+# SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
-    st.title("📈 Zerodha Bot")
+    st.title("📈 Intraday Bot")
     st.markdown("---")
 
-    st.subheader("🔐 API Authentication")
-    api_key = st.text_input("API Key", type="password", placeholder="Your Kite API Key")
-    api_secret = st.text_input("API Secret", type="password", placeholder="Your Kite API Secret")
+    # ── Data Source Selector ──────────────────
+    st.subheader("📡 Data Source")
+    data_source = st.radio(
+        "Select data source",
+        options=["yfinance (Free, Default)", "Zerodha Kite Connect"],
+        index=0,
+        help="yfinance fetches real NSE data for free. Zerodha enables live order placement.",
+    )
+    data_source_key = "yfinance" if data_source.startswith("yfinance") else "zerodha"
+    st.session_state.data_source = data_source_key
 
-    if api_key:
-        login_url = generate_login_url(api_key)
-        st.markdown(f"[🔗 Login to Zerodha Kite]({login_url})")
-        request_token = st.text_input("Request Token", placeholder="From redirect URL after login")
+    if data_source_key == "yfinance":
+        st.success("yfinance: Real NSE data, no API key needed")
+        st.caption("Live prices refreshed every 5 min. Options orders run as paper trades.")
 
-        if st.button("Generate Access Token", use_container_width=True):
-            if api_secret and request_token:
-                with st.spinner("Generating token..."):
-                    try:
-                        access_token = generate_access_token(api_key, api_secret, request_token)
-                        kite = get_kite_client(api_key, access_token)
-                        profile = get_profile(kite)
-                        st.session_state.kite = kite
-                        st.session_state.access_token = access_token
-                        st.session_state.profile = profile
-                        st.success(f"Logged in as: {profile.get('user_name', 'User')}")
-                    except Exception as e:
-                        st.error(f"Auth failed: {e}")
+    else:
+        # ── Zerodha Auth ──────────────────────
+        st.markdown("---")
+        st.subheader("🔐 Zerodha Authentication")
+        if not _KITE_AVAILABLE:
+            st.error("kiteconnect package not installed. Run: pip install kiteconnect")
+        else:
+            api_key = st.text_input("API Key", type="password", placeholder="Your Kite API Key")
+            api_secret = st.text_input("API Secret", type="password", placeholder="Your Kite API Secret")
+
+            if api_key:
+                login_url = generate_login_url(api_key)
+                st.markdown(f"[🔗 Login to Zerodha Kite]({login_url})")
+                request_token = st.text_input("Request Token", placeholder="From redirect URL")
+
+                if st.button("Generate Access Token", use_container_width=True):
+                    if api_secret and request_token:
+                        with st.spinner("Generating token..."):
+                            try:
+                                access_token = generate_access_token(api_key, api_secret, request_token)
+                                kite = get_kite_client(api_key, access_token)
+                                profile = get_profile(kite)
+                                st.session_state.kite = kite
+                                st.session_state.access_token = access_token
+                                st.session_state.profile = profile
+                                st.success(f"Logged in as: {profile.get('user_name', 'User')}")
+                            except Exception as e:
+                                st.error(f"Auth failed: {e}")
+                    else:
+                        st.warning("Enter API Secret and Request Token")
+
+            if st.session_state.kite:
+                st.success("Zerodha connected — live data & orders enabled")
             else:
-                st.warning("Enter API Secret and Request Token")
+                st.info("Login above to enable live data and order placement")
 
-    # Demo mode
-    st.markdown("---")
-    demo_mode = st.toggle("Demo Mode (No real API needed)", value=True)
-    if demo_mode and not st.session_state.kite:
-        st.info("Running in Demo Mode with simulated data")
-
+    # ── Risk Settings ─────────────────────────
     st.markdown("---")
     st.subheader("⚙️ Risk Settings")
     capital = st.number_input("Trading Capital (₹)", min_value=10000, value=100000, step=10000)
     max_risk_pct = st.slider("Max Risk per Trade (%)", 0.5, 3.0, 1.0, 0.5)
     max_daily_loss = st.slider("Max Daily Loss (%)", 1.0, 5.0, 3.0, 0.5)
     max_trades = st.number_input("Max Trades/Day", min_value=1, max_value=20, value=5)
-    paper_trade = st.toggle("Paper Trade Mode", value=True)
-    st.session_state.paper_trade = paper_trade
 
-    if paper_trade:
+    # Paper trade is forced ON for yfinance (no order API)
+    if data_source_key == "yfinance":
+        paper_trade = True
+        st.toggle("Paper Trade Mode", value=True, disabled=True,
+                  help="Always ON with yfinance — no live order API available")
         st.success("Paper Trade: No real money at risk")
     else:
-        st.warning("LIVE TRADE: Real money will be used!")
+        paper_trade = st.toggle("Paper Trade Mode", value=True)
+        st.session_state.paper_trade = paper_trade
+        if paper_trade:
+            st.success("Paper Trade: No real money at risk")
+        else:
+            st.warning("LIVE TRADE: Real money will be used!")
+
+    st.session_state.paper_trade = paper_trade
 
     st.markdown("---")
     st.caption("⚠️ Disclaimer: This bot is for educational purposes. Trading involves risk.")
@@ -144,8 +220,15 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 # MAIN CONTENT
 # ─────────────────────────────────────────────
-st.title("📈 Zerodha Intraday Auto Trading Bot")
-st.caption(f"Market Status: {'🟢 Open' if time(9,15) <= datetime.now().time() <= time(15,30) else '🔴 Closed'} | Mode: {'📄 Paper Trade' if paper_trade else '💰 Live Trade'}")
+st.title("📈 Intraday Auto Trading Bot")
+_src_label = "yfinance (Live NSE Data)" if data_source_key == "yfinance" else (
+    "Zerodha Kite (Connected)" if st.session_state.kite else "Zerodha Kite (Not Connected)"
+)
+st.caption(
+    f"Data Source: **{_src_label}** | "
+    f"Market: {'🟢 Open' if time(9,15) <= datetime.now().time() <= time(15,30) else '🔴 Closed'} | "
+    f"Mode: {'📄 Paper Trade' if paper_trade else '💰 Live Trade'}"
+)
 
 tabs = st.tabs(["📊 Dashboard", "📉 Equity Trading", "📈 Options Trading", "📋 Strategy Guide", "📜 Trade Log"])
 
@@ -195,13 +278,17 @@ with tabs[0]:
     col_a, col_b = st.columns(2)
     with col_a:
         st.subheader("Account Info")
-        if st.session_state.profile:
+        if data_source_key == "yfinance":
+            st.info("Using yfinance — no account login required")
+            st.write("**Data Source:** Yahoo Finance (NSE)")
+            st.write("**Order Mode:** Paper Trade only")
+        elif st.session_state.profile:
             p = st.session_state.profile
             st.write(f"**Name:** {p.get('user_name')}")
             st.write(f"**User ID:** {p.get('user_id')}")
             st.write(f"**Email:** {p.get('email')}")
         else:
-            st.info("Login with Zerodha API or use Demo Mode")
+            st.info("Login with Zerodha API in the sidebar to enable live trading")
 
     with col_b:
         st.subheader("Risk Summary")
@@ -237,8 +324,12 @@ with tabs[1]:
     Win Rate: **{strat.win_rate}** | Expected Monthly Return: **{strat.monthly_return}** | Timeframe: **{strat.timeframe}**
     """)
 
-    # Generate signals on sample data
-    df = generate_sample_ohlcv(symbol)
+    # Fetch OHLCV data
+    with st.spinner(f"Fetching {symbol} data from {data_source_key}..."):
+        df, is_live = get_ohlcv(symbol, data_source_key)
+    if not is_live:
+        st.warning(f"Could not fetch live data for **{symbol}** — showing simulated data. "
+                   "Check the symbol (e.g. RELIANCE, TCS, INFY for NSE stocks).")
 
     if selected_strategy == "EMA Crossover":
         df_signals = EMAcrossover.generate_signals(df)
@@ -354,7 +445,10 @@ with tabs[2]:
     """)
 
     # Underlying chart
-    df_idx = generate_sample_ohlcv(underlying, 78)
+    with st.spinner(f"Fetching {underlying} data from {data_source_key}..."):
+        df_idx, idx_live = get_ohlcv(underlying, data_source_key)
+    if not idx_live:
+        st.warning(f"Could not fetch live data for **{underlying}** — showing simulated data.")
     df_idx["ema9"] = compute_ema(df_idx["close"], 9)
     df_idx["ema21"] = compute_ema(df_idx["close"], 21)
     df_idx["vwap"] = compute_vwap(df_idx)
@@ -503,22 +597,25 @@ with tabs[3]:
 
     st.markdown("### Setup Guide")
     st.code("""
+# ── Option A: yfinance (Default, Free) ─────────────────────────────
+# 1. No API key needed — select "yfinance" in the sidebar
+# 2. Enter any NSE symbol: RELIANCE, TCS, INFY, HDFCBANK, etc.
+#    For indices: NIFTY → ^NSEI, BANKNIFTY → ^NSEBANK
+# 3. Data refreshes every 5 minutes during market hours
+# 4. All orders run as Paper Trades (yfinance has no order API)
+
+# ── Option B: Zerodha Kite Connect (Live Trading) ──────────────────
 # 1. Get Zerodha Kite Connect API Access
 #    → Visit: https://developers.kite.trade
-#    → Create an app, get API Key and API Secret (₹2000/month)
-
-# 2. Daily Login Flow:
-#    → Click "Login to Zerodha Kite" link in sidebar
-#    → Login with your credentials
+#    → Create an app (₹2000/month for live trading)
+# 2. Select "Zerodha Kite Connect" in the sidebar
+# 3. Daily Login Flow:
+#    → Click "Login to Zerodha Kite" link
 #    → Copy the request_token from the redirect URL
-#    → Paste in sidebar and click "Generate Access Token"
+#    → Paste and click "Generate Access Token"
+# 4. Disable Paper Trade to place real orders (use with caution!)
 
-# 3. Configure Settings:
-#    → Set your capital, risk per trade, daily loss limit
-#    → Select strategy (EMA Crossover recommended for beginners)
-#    → Keep Paper Trade ON until you're confident
-
-# 4. How to Read Signals:
+# ── How to Read Signals ────────────────────────────────────────────
 #    BUY signal  → Green triangle pointing UP below candle
 #    SELL signal → Red triangle pointing DOWN above candle
     """, language="python")

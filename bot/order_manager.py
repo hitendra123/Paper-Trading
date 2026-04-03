@@ -1,9 +1,18 @@
 """
-Order Manager and Risk Manager for Zerodha Kite Connect
+Order Manager and Risk Manager.
+Supports two modes:
+  - Paper trade (default, works with any data source)
+  - Live trade via Zerodha Kite Connect (requires kiteconnect + valid session)
 """
-from kiteconnect import KiteConnect
 from datetime import datetime
 import pandas as pd
+
+try:
+    from kiteconnect import KiteConnect as _KiteConnect  # noqa: F401
+    _KITE_AVAILABLE = True
+except ImportError:
+    _KiteConnect = None
+    _KITE_AVAILABLE = False
 
 
 # ─────────────────────────────────────────────
@@ -57,10 +66,10 @@ class RiskManager:
 # ─────────────────────────────────────────────
 
 class OrderManager:
-    def __init__(self, kite: KiteConnect, risk_manager: RiskManager, paper_trade: bool = True):
+    def __init__(self, kite=None, risk_manager: RiskManager = None, paper_trade: bool = True):
         self.kite = kite
-        self.risk = risk_manager
-        self.paper_trade = paper_trade
+        self.risk = risk_manager or RiskManager()
+        self.paper_trade = paper_trade or (kite is None)
         self.open_positions = {}
         self.trade_log = []
 
